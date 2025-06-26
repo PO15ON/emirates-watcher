@@ -1,12 +1,15 @@
 # monitor_status.py
 """Monitor Emirates Group Careers application status and email on changes.
 
-Improvements
-============
-* **Robust cookie‑banner dismissal** – waits up to 8 s for the OneTrust button
-  every time we attempt to click the *Log in* button.
-* **Reliable login click** – prioritises `#login` selector (unique id) and uses
-  lowercase text variant.
+**Gmail SMTP**
+--------------
+Now handles **SMTPAuthenticationError** gracefully and reminds you to use a
+16‑character Google *App Password* (required since May 30 2022).
+
+**GitHub Actions**
+------------------
+Compatible with GitHub Actions runner (Ubuntu). Fixes Playwright v1.44
+breaking change in `.is_visible()` – removed `timeout=` arg.
 """
 from __future__ import annotations
 
@@ -19,8 +22,6 @@ import unittest
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Final, Optional
-import time
-from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -29,7 +30,7 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 
 STATUS_FILE: Final[Path] = Path("latest_status.txt")
-CHECK_TIMEOUT_MS: Final[int] = int(os.getenv("CHECK_TIMEOUT_MS", "60000"))  # 60 s
+CHECK_TIMEOUT_MS: Final[int] = int(os.getenv("CHECK_TIMEOUT_MS", "60000"))
 COOKIE_WAIT_MS: Final[int] = 8000
 
 load_dotenv()
@@ -40,15 +41,15 @@ EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_TO = os.getenv("EMAIL_TO")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))  # 465=SSL, 587=TLS
 
-# Selector constants
 APPLICATION_TAB = (
     "#main-panel > section > div.section__header.section__header--tabs > "
     "div > ul > li:nth-child(2) > a"
 )
 STATUS_CELL = (
-    "#main-panel > section > div.section__content > article > div > div > table > tbody > tr:nth-child(2) > td:nth-child(2)"
+    "#main-panel > section > div.section__content > article > div > div > "
+    "table > tbody > tr:nth-child(1) > td:nth-child(2)"
 )
 COOKIE_ACCEPT = "#onetrust-accept-btn-handler"
 LOGIN_BUTTON_ID = "#login"
@@ -57,7 +58,7 @@ LOGIN_BUTTON_ID = "#login"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _require(var: Optional[str], name: str) -> str:  # noqa: D401
+def _require(var: Optional[str], name: str) -> str:
     if not var:
         raise RuntimeError(f"Environment variable {name} is required but missing.")
     return var
@@ -78,11 +79,11 @@ def _async_playwright():
         return async_playwright
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "Playwright not installed. Run 'pip install playwright' and 'playwright install'."
+            "Playwright not installed. Run 'pip install playwright' & 'playwright install'."
         ) from exc
 
 # ---------------------------------------------------------------------------
-# Disk I/O
+# Disk helpers
 # ---------------------------------------------------------------------------
 
 def read_last_status(path: Path = STATUS_FILE) -> str:
@@ -92,8 +93,10 @@ def write_last_status(status: str, path: Path = STATUS_FILE) -> None:
     path.write_text(status)
 
 # ---------------------------------------------------------------------------
-# Email
+# Email helpers
 # ---------------------------------------------------------------------------
+
+from smtplib import SMTPAuthenticationError
 
 def _compose_email(new_status: str) -> EmailMessage:
     msg = EmailMessage()
@@ -104,81 +107,80 @@ def _compose_email(new_status: str) -> EmailMessage:
     return msg
 
 def _send_email(new_status: str) -> None:
-    with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=ssl.create_default_context()) as s:
-        s.login(EMAIL_FROM, EMAIL_PASSWORD)
-        s.send_message(_compose_email(new_status))
+    msg = _compose_email(new_status)
+    ctx = ssl.create_default_context()
+
+    try:
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=ctx) as s:
+                s.login(EMAIL_FROM, EMAIL_PASSWORD)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
+                s.starttls(context=ctx)
+                s.login(EMAIL_FROM, EMAIL_PASSWORD)
+                s.send_message(msg)
+    except SMTPAuthenticationError as err:
+        raise RuntimeError(
+            "Gmail rejected your credentials. You must use a 16-char App Password."
+        ) from err
 
 # ---------------------------------------------------------------------------
 # Playwright helpers
 # ---------------------------------------------------------------------------
 
-async def _dismiss_cookies(page) -> None:  # noqa: D401
+async def _dismiss_cookies(page):
     try:
         await page.wait_for_selector(COOKIE_ACCEPT, timeout=COOKIE_WAIT_MS)
         await page.click(COOKIE_ACCEPT, force=True)
         await page.wait_for_selector(COOKIE_ACCEPT, state="detached", timeout=5000)
     except Exception:
-        # banner didn’t appear – harmless
         pass
 
-
-async def _click_login(page) -> None:  # noqa: D401
-    """Ensure cookie banner gone, then click the Log in button."""
+async def _click_login(page):
     await _dismiss_cookies(page)
-
-    candidates = [
-        LOGIN_BUTTON_ID,
-        'button:has-text("Log in")',  # note lowercase "in"
-        'text="Log in"',
-        'button[value="Log in"]',
-        'button[type="submit"]',
-    ]
-    for sel in candidates:
+    for sel in (LOGIN_BUTTON_ID, 'button:has-text("Log in")', 'text="Log in"'):
         if await page.is_visible(sel):
             await page.locator(sel).click(force=True)
             return
-    raise RuntimeError("Login button not found – please update selectors.")
+    raise RuntimeError("Login button not found – update selectors.")
 
 # ---------------------------------------------------------------------------
 # Core scraping
 # ---------------------------------------------------------------------------
 
-async def _fetch_status() -> str:  # noqa: D401
+async def _fetch_status() -> str:
     async_playwright = _async_playwright()
     from playwright.async_api import TimeoutError as PWTimeoutError  # type: ignore
 
     async with async_playwright() as p:  # type: ignore[attr-defined]
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
+        page = await (await browser.new_context()).new_page()
 
         await page.goto(
-            "https://external.emiratesgroupcareers.com/en_US/"
-            "careersmarketplace/ProfileJobApplications",
+            "https://external.emiratesgroupcareers.com/en_US/careersmarketplace/ProfileJobApplications",
             wait_until="networkidle",
             timeout=CHECK_TIMEOUT_MS,
         )
 
-        # Login
         if await page.is_visible('input[name="username"]'):
             await page.fill('input[name="username"]', USERNAME)
             await page.fill('input[name="password"]', PASSWORD)
             await _click_login(page)
             await page.wait_for_load_state("networkidle")
 
-        # Applications tab
-        if await page.is_visible(APPLICATION_TAB, timeout=CHECK_TIMEOUT_MS):
+        try:
+            await page.wait_for_selector(APPLICATION_TAB, timeout=CHECK_TIMEOUT_MS)
             await page.click(APPLICATION_TAB)
             await page.wait_for_load_state("networkidle")
+        except PWTimeoutError:
+            print("[warn] Applications tab not found")
 
-        # Status extraction
         try:
             await page.wait_for_selector(STATUS_CELL, timeout=CHECK_TIMEOUT_MS)
-            text = await page.text_content(STATUS_CELL, timeout=CHECK_TIMEOUT_MS)
+            text = await page.text_content(STATUS_CELL)
         except PWTimeoutError:
-            print(
-                f"[warning] Status cell missing after {CHECK_TIMEOUT_MS/1000:.0f}s; returning empty."
-            )
+            print("[warn] Status cell not found; returning empty.")
             text = None
         return (text or "").strip()
 
@@ -186,13 +188,11 @@ async def _fetch_status() -> str:  # noqa: D401
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-async def _check_once() -> None:  # noqa: D401
-    status = await _fetch_status()
-    last = read_last_status()
+async def _check_once() -> None:
+    status, last = await _fetch_status(), read_last_status()
     if status != last:
         write_last_status(status)
         if status:
-            print(status)
             _send_email(status)
         print(f"Status changed: {last or '[none]'} → {status or '[empty]'}")
     else:
@@ -204,7 +204,7 @@ async def _check_once() -> None:  # noqa: D401
 
 class _HelperTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path("_tmp_status.txt")
+        self.tmp = Path("_tmp.txt")
         self.tmp.unlink(missing_ok=True)
 
     def tearDown(self):
@@ -212,21 +212,21 @@ class _HelperTests(unittest.TestCase):
 
     def test_read_write(self):
         self.assertEqual(read_last_status(self.tmp), "")
-        write_last_status("Under Review", self.tmp)
-        self.assertEqual(read_last_status(self.tmp), "Under Review")
+        write_last_status("Pending", self.tmp)
+        self.assertEqual(read_last_status(self.tmp), "Pending")
 
-    def test_compose_mail(self):
+    def test_compose_email(self):
         self.assertIn("Offer", _compose_email("Offer").get_content())
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Entry
 # ---------------------------------------------------------------------------
 
-def _main() -> None:  # noqa: D401
-    while True:
-        print("Checking status at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+def _main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        unittest.main(argv=[sys.argv[0]])
+    else:
         asyncio.run(_check_once())
-        time.sleep(30*60)
 
 if __name__ == "__main__":
     _main()
