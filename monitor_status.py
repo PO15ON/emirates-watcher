@@ -3,13 +3,12 @@
 
 **Gmail SMTP**
 --------------
-Now handles **SMTPAuthenticationError** gracefully and reminds you to use a
-16‑character Google *App Password* (required since May 30 2022).
+Handles **SMTPAuthenticationError** gracefully with a clear message
+about using a Google App Password.
 
-**GitHub Actions**
-------------------
-Compatible with GitHub Actions runner (Ubuntu). Fixes Playwright v1.44
-breaking change in `.is_visible()` – removed `timeout=` arg.
+**GitHub Actions Compatible**
+-----------------------------
+Timeouts and visibility checks adjusted to support Playwright in CI.
 """
 from __future__ import annotations
 
@@ -25,10 +24,6 @@ from typing import Final, Optional
 
 from dotenv import load_dotenv
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 STATUS_FILE: Final[Path] = Path("latest_status.txt")
 CHECK_TIMEOUT_MS: Final[int] = int(os.getenv("CHECK_TIMEOUT_MS", "60000"))
 COOKIE_WAIT_MS: Final[int] = 8000
@@ -41,7 +36,7 @@ EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_TO = os.getenv("EMAIL_TO")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))  # 465=SSL, 587=TLS
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 
 APPLICATION_TAB = (
     "#main-panel > section > div.section__header.section__header--tabs > "
@@ -54,9 +49,6 @@ STATUS_CELL = (
 COOKIE_ACCEPT = "#onetrust-accept-btn-handler"
 LOGIN_BUTTON_ID = "#login"
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _require(var: Optional[str], name: str) -> str:
     if not var:
@@ -69,9 +61,6 @@ EMAIL_FROM = _require(EMAIL_FROM, "EMAIL_FROM")
 EMAIL_TO = _require(EMAIL_TO, "EMAIL_TO")
 EMAIL_PASSWORD = _require(EMAIL_PASSWORD, "EMAIL_PASSWORD")
 
-# ---------------------------------------------------------------------------
-# Lazy Playwright import
-# ---------------------------------------------------------------------------
 
 def _async_playwright():
     try:
@@ -82,9 +71,6 @@ def _async_playwright():
             "Playwright not installed. Run 'pip install playwright' & 'playwright install'."
         ) from exc
 
-# ---------------------------------------------------------------------------
-# Disk helpers
-# ---------------------------------------------------------------------------
 
 def read_last_status(path: Path = STATUS_FILE) -> str:
     return path.read_text().strip() if path.exists() else ""
@@ -92,9 +78,6 @@ def read_last_status(path: Path = STATUS_FILE) -> str:
 def write_last_status(status: str, path: Path = STATUS_FILE) -> None:
     path.write_text(status)
 
-# ---------------------------------------------------------------------------
-# Email helpers
-# ---------------------------------------------------------------------------
 
 from smtplib import SMTPAuthenticationError
 
@@ -125,9 +108,6 @@ def _send_email(new_status: str) -> None:
             "Gmail rejected your credentials. You must use a 16-char App Password."
         ) from err
 
-# ---------------------------------------------------------------------------
-# Playwright helpers
-# ---------------------------------------------------------------------------
 
 async def _dismiss_cookies(page):
     try:
@@ -140,14 +120,11 @@ async def _dismiss_cookies(page):
 async def _click_login(page):
     await _dismiss_cookies(page)
     for sel in (LOGIN_BUTTON_ID, 'button:has-text("Log in")', 'text="Log in"'):
-        if await page.is_visible(sel):
+        if await page.locator(sel).is_visible():
             await page.locator(sel).click(force=True)
             return
     raise RuntimeError("Login button not found – update selectors.")
 
-# ---------------------------------------------------------------------------
-# Core scraping
-# ---------------------------------------------------------------------------
 
 async def _fetch_status() -> str:
     async_playwright = _async_playwright()
@@ -157,24 +134,30 @@ async def _fetch_status() -> str:
         browser = await p.chromium.launch(headless=True)
         page = await (await browser.new_context()).new_page()
 
-        await page.goto(
-            "https://external.emiratesgroupcareers.com/en_US/careersmarketplace/ProfileJobApplications",
-            wait_until="networkidle",
-            timeout=CHECK_TIMEOUT_MS,
-        )
+        try:
+            await page.goto(
+                "https://external.emiratesgroupcareers.com/en_US/careersmarketplace/ProfileJobApplications",
+                wait_until="load",
+                timeout=CHECK_TIMEOUT_MS,
+            )
+        except PWTimeoutError:
+            print("[warn] Page load timed out.")
 
-        if await page.is_visible('input[name="username"]'):
+        if await page.locator('input[name="username"]').is_visible():
             await page.fill('input[name="username"]', USERNAME)
             await page.fill('input[name="password"]', PASSWORD)
             await _click_login(page)
-            await page.wait_for_load_state("networkidle")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except PWTimeoutError:
+                print("[warn] Login network idle wait timed out.")
 
         try:
             await page.wait_for_selector(APPLICATION_TAB, timeout=CHECK_TIMEOUT_MS)
             await page.click(APPLICATION_TAB)
-            await page.wait_for_load_state("networkidle")
+            await page.wait_for_load_state("networkidle", timeout=10000)
         except PWTimeoutError:
-            print("[warn] Applications tab not found")
+            print("[warn] Applications tab not found or network idle timeout")
 
         try:
             await page.wait_for_selector(STATUS_CELL, timeout=CHECK_TIMEOUT_MS)
@@ -184,9 +167,6 @@ async def _fetch_status() -> str:
             text = None
         return (text or "").strip()
 
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
 
 async def _check_once() -> None:
     status, last = await _fetch_status(), read_last_status()
@@ -198,9 +178,6 @@ async def _check_once() -> None:
     else:
         print("No change detected.")
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 class _HelperTests(unittest.TestCase):
     def setUp(self):
@@ -218,9 +195,6 @@ class _HelperTests(unittest.TestCase):
     def test_compose_email(self):
         self.assertIn("Offer", _compose_email("Offer").get_content())
 
-# ---------------------------------------------------------------------------
-# Entry
-# ---------------------------------------------------------------------------
 
 def _main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "test":
