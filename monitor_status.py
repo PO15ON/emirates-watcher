@@ -44,7 +44,7 @@ APPLICATION_TAB = (
 )
 STATUS_CELL = (
     "#main-panel > section > div.section__content > article > div > div > "
-    "table > tbody > tr:nth-child(1) > td:nth-child(2)"
+    "table > tbody > tr:nth-child(2) > td:nth-child(2)"
 )
 COOKIE_ACCEPT = "#onetrust-accept-btn-handler"
 LOGIN_BUTTON_ID = "#login"
