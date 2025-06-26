@@ -170,7 +170,7 @@ async def _fetch_status() -> str:
 
 async def _check_once() -> None:
     status, last = await _fetch_status(), read_last_status()
-    if status != last:
+    if status != "Phone Screening Scheduled2":
         write_last_status(status)
         if status:
             _send_email(status)
