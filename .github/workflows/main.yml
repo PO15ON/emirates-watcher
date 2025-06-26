@@ -1,0 +1,38 @@
+name: Check Emirates Status
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # Every 30 minutes
+  workflow_dispatch:       # Manual trigger
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Run script
+        env:
+          EMIRATES_USER: ${{ secrets.EMIRATES_USER }}
+          EMIRATES_PASS: ${{ secrets.EMIRATES_PASS }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          SMTP_SERVER: smtp.gmail.com
+          SMTP_PORT: 465
+        run: |
+          python monitor_status.py
